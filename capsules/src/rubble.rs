@@ -17,14 +17,27 @@
 //!   rubble computations?
 //! * 1: give buffer to be written to for incoming scanning data
 //!
+//! * 0xFFFF_x: Supply attribute data for BLE attribute with u16 handle "x".
+//!   This will overwrite any previous data for the an attribute with the given handle.
+//!
+//!   The data in the buffer is structured to transmit both metadata, and the variable-length
+//!   attribute value. The version of this format is supplied via the add attribute command.
+//!
+//!   For format version 0, the buffer should be in the format:
+//!   - Format version = 0 - 2 byte native endian unsigned integer (u16)
+//!   - Attribute UUID - 16 bytes
+//!   - Attribute handle - 2 byte native endian unsigned integer (u16)
+//!   - Length attribute value - 2 byte native endian unsigned integer (u16)
+//!   - Attribute value - N bytes
+//!
 //! ### Subscribe system call
 //!
 //! * 0: subscribe to advertisement scanning data
+//! * 1: subscribe to callbacks for connection-related information. The first
+//!   argument is used as to multiplex what connection-related event happened.
 //!
-//! ### Command system call
-//!
-//! The `command` system call supports two arguments, `command number` and
-//! `subcommand number`.
+//!   * r0 = 0: new connection. r1 is a ptr to freshly allocated connection information
+//!   * r0 = 1: connection closed.
 //!
 //! We use `command number` to specify one of the following operations:
 //!
@@ -47,16 +60,32 @@
 //! - 3: stop scanning
 //!
 //!   Both arguments should be 0.
+//! - 4: end connection
+//!
+//!   We don't yet allow the device to initiate starting connections. But you
+//!   can end a connection.
+//! - 5: add attribute to connection
+//!
+//!   First argument is the format version of the data in the buffer.
+//!   This takes the data from the buffer most recently supplied via ALLOW 2 and adds it to the
+//!   ATT store for the current connection. This will replace any existing attributes with the same
+//!   Handle number.
+//! - 5: remove attribute
+//!
+//!   The first argument should be the attribute handle to remove. The second
+//!   argument should be 0.
+//!
+//!   This removes an attribute which was originally provided with allow 2.
 //! - TODO: scanning
-//! - TODO: connections??
 mod timer;
 
-use core::{cell::RefCell, convert::TryInto, marker::PhantomData};
+use core::{cell::RefCell, convert::TryInto, marker::PhantomData, mem::size_of};
 use kernel::debug;
 use kernel::hil::rubble::BleRadio;
-use kernel::{AppId, AppSlice, Callback, ReturnCode, Shared};
+use kernel::{procs::Error, AppId, AppSlice, Callback, ReturnCode, Shared};
 
 use rubble::{
+    att::{Attribute, Handle},
     bytes::{ByteReader, FromBytes},
     config::Config,
     link::{
@@ -80,11 +109,107 @@ pub const CMD_START_ADVERTISING: usize = 0;
 pub const CMD_STOP_ADVERTISING: usize = 1;
 pub const CMD_START_SCANNING: usize = 2;
 pub const CMD_STOP_SCANNING: usize = 3;
+pub const CMD_END_CONNECTION: usize = 4;
 
 pub const CMD_ARG_UNUSED: usize = 0;
 
+pub const SUBSCRIBE_SCANNING_DATA: usize = 0;
+pub const SUBSCRIBE_CONNECTION_EVTS: usize = 1;
+
+pub const CONNECTION_EVENT_NEW: usize = 0;
+pub const CONNECTION_EVENT_CLOSED: usize = 1;
+pub const CONNECTION_EVENT_ATTRIBUTE_WRITE: usize = 2;
+
 pub const ALLOW_OUTGOING_AD_BUFFER: usize = 0;
 pub const ALLOW_INCOMING_SCANNING_DATA: usize = 1;
+pub const ALLOW_CONNECTION_ATTRIBUTES: usize = 2;
+
+/// Input format for attributes
+#[repr(C)]
+pub struct RubbleAttributeMetadata {
+    /// Attribute UUID
+    att_uuid: [u8; 16],
+    /// Attribute handle
+    att_handle: u16,
+    // TODO: BLE Attribute Permissions, once we get support for them in Rubble
+}
+
+const ATT_OFFSET_FORMAT_VERSION: usize = 0;
+const ATT_OFFSET_HANDLE: usize = size_of::<u16>();
+const ATT_OFFSET_UUID: usize = ATT_OFFSET_HANDLE + size_of::<u16>();
+const ATT_OFFSET_DATA_LEN: usize = ATT_OFFSET_UUID + size_of::<[u8; 16]>();
+const ATT_OFFSET_DATA: usize = ATT_OFFSET_DATA_LEN + size_of::<u16>();
+
+impl RubbleAttributeMetadata {
+    pub fn from_bytes(bytes: [u8; RUBBLE_ATTRIBUTE_SIZE]) -> Self {
+        RubbleAttributeMetadata {
+            att_uuid: bytes[0..16].try_into().unwrap(),
+            att_handle: u16::from_ne_bytes(bytes[16..18].try_into().unwrap()),
+        }
+    }
+}
+
+struct AttributeDataBuffer(kernel::AppSlice<kernel::Shared, u8>);
+
+impl AttributeDataBuffer {
+    /// Validates the metadata at the start of a given attribute data buffer.
+    fn new(buffer: kernel::AppSlice<kernel::Shared, u8>) -> Result<Self, ReturnCode> {
+        let data = buffer.as_ref();
+        if data.len() < ATT_OFFSET_DATA {
+            return Err(ReturnCode::EINVAL);
+        }
+
+        let format_version =
+            u16::from_ne_bytes(data[ATT_OFFSET_FORMAT_VERSION..][..2].try_into().unwrap());
+        if format_version != 0 {
+            return Err(ReturnCode::EINVAL);
+        }
+
+        let data_len = u16::from_ne_bytes(data[ATT_OFFSET_DATA_LEN..][..2].try_into().unwrap());
+
+        if data.len() != ATT_OFFSET_DATA + data_len {
+            return Err(ReturnCode::EINVAL);
+        }
+
+        Ok(AttributeDataBuffer(buffer))
+    }
+
+    fn uuid(&self) -> [u8; 16] {
+        self.0.as_ref()[ATT_OFFSET_UUID..][..16].try_into().unwrap()
+    }
+
+    fn handle(&self) -> u16 {
+        u16::from_ne_bytes(
+            self.0.as_ref()[ATT_OFFSET_HANDLE..][..2]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.0.as_ref()[ATT_OFFSET_DATA..]
+    }
+
+    fn att_data_buffer_to_rubble_attribute(data: &[u8]) -> Attribute<'_> {
+        Attribute::new(
+            rubble::att::AttUuid::Uuid128(self.uuid().into()),
+            Handle::from_u16(self.handle()),
+            self.data(),
+        )
+    }
+}
+
+struct AttributeListNode {
+    data: AttributeDataBuffer,
+    next: Option<Owned<AttributeListNode>>,
+}
+
+#[derive(Default)]
+struct AttributeList {
+    head: Option<AttributeListNode>,
+}
+
+impl Default for AttributeList {}
 
 /// Process specific memory
 pub struct App {
@@ -92,6 +217,7 @@ pub struct App {
     incoming_scanning_data: Option<kernel::AppSlice<kernel::Shared, u8>>,
     advertisement_interval: Duration,
     scan_interval_ms: Duration,
+    current_connection_attributes: Option<kernel::AppSlice<kernel::Shared>>,
 }
 
 impl Default for App {
@@ -101,6 +227,7 @@ impl Default for App {
             incoming_scanning_data: None,
             advertisement_interval: Duration::from_millis(200),
             scan_interval_ms: Duration::from_millis(200),
+            current_connection_attributes: None,
         }
     }
 }
@@ -125,6 +252,10 @@ where
     type ChannelMapper =
         rubble::l2cap::BleChannelMap<rubble::att::NoAttributes, rubble::security::NoSecurity>;
     type PacketQueue = &'static mut SimpleQueue;
+}
+
+struct DynamicAttributes {
+    attributes: Option<kernel::AppSlice<kernel::Shared, RubbleAttribute>>,
 }
 
 static mut TX_QUEUE: SimpleQueue = SimpleQueue::new();
